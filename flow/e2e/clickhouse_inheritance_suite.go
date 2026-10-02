@@ -75,8 +75,6 @@ func (s ClickHouseSuite) inhRestartReplication(env WorkflowRun, flowJobName stri
 
 // inhWaitForColumn waits until every non-deleted destination row has the expected value of column,
 // keyed by id; ids missing from expected must be NULL
-//
-//nolint:unparam // a helper for column checks on any destination table
 func (s ClickHouseSuite) inhWaitForColumn(env WorkflowRun, dstTable string, column string, expected map[int64]string) {
 	s.t.Helper()
 	EnvWaitFor(s.t, env, 3*time.Minute, "waiting on "+column, func() bool {
@@ -199,6 +197,115 @@ func (s ClickHouseSuite) Test_Inheritance_Divergent_Child_Layouts() {
 	EnvWaitForEqualTablesWithNames(env, s, "waiting on cdc after restart", srcTableName, dstTableName, "id,name,val,n")
 	s.inhWaitForColumn(env, dstTableName, "extra2", map[int64]string{21: "b21-extra2"})
 	s.inhWaitForColumn(env, dstTableName, "extra", map[int64]string{4: "c4-extra-upd", 14: "c14-extra"})
+
+	env.Cancel(s.t.Context())
+	RequireEnvCanceled(s.t, env)
+}
+
+func (s ClickHouseSuite) Test_Inheritance_Children_Created_After_Start() {
+	s.inhRequirePostgres()
+
+	srcTableName := "inh_late_children"
+	parent := s.attachSchemaSuffix(srcTableName)
+	dstTableName := "inh_late_children_dst"
+	flowJobName := s.attachSuffix("inh_late_children")
+	schemaX, schemaY := s.inhTenantSchema("lx"), s.inhTenantSchema("ly")
+
+	// the parent has no children when CDC starts, so both children are found by runtime discovery; both
+	// carry the child-only column note
+	s.inhExec(`CREATE TABLE %s (id BIGINT PRIMARY KEY, name TEXT, val TEXT)`, parent)
+	s.inhExec(`INSERT INTO %s (id, name, val) VALUES (1, 'p1', 'vp1')`, parent)
+
+	connectionGen := FlowConnectionGenerationConfig{
+		FlowJobName:      flowJobName,
+		TableNameMapping: map[string]string{parent: dstTableName},
+		Destination:      s.Peer().Name,
+	}
+	flowConnConfig := connectionGen.GenerateFlowConnectionConfigs(s)
+	flowConnConfig.DoInitialSnapshot = true
+
+	tc := NewTemporalClient(s.t)
+	env := ExecutePeerflow(s.t, tc, flowConnConfig)
+	SetupCDCFlowStatusQuery(s.t, env, flowConnConfig)
+	EnvWaitForEqualTablesWithNames(env, s, "waiting on initial", srcTableName, dstTableName, "id,name,val")
+
+	pub := connpostgres.GetDefaultPublicationName(flowJobName)
+	s.inhExec(`CREATE TABLE %s.%s (id BIGINT PRIMARY KEY, val TEXT, note TEXT, name TEXT)`, schemaX, srcTableName)
+	s.inhExec(`ALTER TABLE %s.%s INHERIT %s`, schemaX, srcTableName, parent)
+	s.inhExec(`CREATE TABLE %s.%s (note TEXT) INHERITS (%s)`, schemaY, srcTableName, parent)
+	s.inhExec(`ALTER TABLE %s.%s ADD PRIMARY KEY (id)`, schemaY, srcTableName)
+	s.inhExec(`ALTER PUBLICATION %s ADD TABLE %s.%s, %s.%s`, pub, schemaX, srcTableName, schemaY, srcTableName)
+
+	s.inhExec(`INSERT INTO %s.%s (id, name, val, note) VALUES (2, 'x2', 'vx2', 'nx2')`, schemaX, srcTableName)
+	s.inhExec(`INSERT INTO %s.%s (id, name, val, note) VALUES (3, 'y3', 'vy3', 'ny3')`, schemaY, srcTableName)
+	s.inhExec(`INSERT INTO %s.%s (id, name, val, note) VALUES (4, 'x4', 'vx4', 'nx4')`, schemaX, srcTableName)
+	s.inhExec(`UPDATE %s.%s SET name = 'y3-upd' WHERE id = 3`, schemaY, srcTableName)
+	s.inhExec(`UPDATE %s.%s SET val = 'vx2-upd' WHERE id = 2`, schemaX, srcTableName)
+
+	EnvWaitForEqualTablesWithNames(env, s, "waiting on cdc from late children", srcTableName, dstTableName, "id,name,val")
+	// the parent's own row gets the type's default, since the mirror is not in nullable mode
+	s.inhWaitForColumn(env, dstTableName, "note", map[int64]string{1: "", 2: "nx2", 3: "ny3", 4: "nx4"})
+
+	// both children report note as added, but the destination gets a single schema delta
+	var noteDeltas int
+	require.NoError(s.t, s.catalog.QueryRow(s.t.Context(),
+		`SELECT count(*) FROM peerdb_stats.schema_deltas_audit_log l,
+		 jsonb_array_elements(l.delta_info->'added_columns') AS c
+		 WHERE l.flow_job_name = $1 AND c->>'name' = 'note'`, flowJobName).Scan(&noteDeltas))
+	require.Equal(s.t, 1, noteDeltas)
+
+	env.Cancel(s.t.Context())
+	RequireEnvCanceled(s.t, env)
+}
+
+func (s ClickHouseSuite) Test_Inheritance_Child_Of_Two_Mirrored_Parents() {
+	s.inhRequirePostgres()
+
+	parent1Name, parent2Name := "inh_multi_p1", "inh_multi_p2"
+	parent1, parent2 := s.attachSchemaSuffix(parent1Name), s.attachSchemaSuffix(parent2Name)
+	dst1, dst2 := "inh_multi_p1_dst", "inh_multi_p2_dst"
+	flowJobName := s.attachSuffix("inh_multi")
+	schemaM := s.inhTenantSchema("mm")
+
+	s.inhExec(`CREATE TABLE %s (id BIGINT PRIMARY KEY, name TEXT)`, parent1)
+	s.inhExec(`CREATE TABLE %s (id BIGINT PRIMARY KEY, name TEXT)`, parent2)
+	s.inhExec(`INSERT INTO %s (id, name) VALUES (1, 'p1')`, parent1)
+	s.inhExec(`INSERT INTO %s (id, name) VALUES (2, 'p2')`, parent2)
+
+	connectionGen := FlowConnectionGenerationConfig{
+		FlowJobName:      flowJobName,
+		TableNameMapping: map[string]string{parent1: dst1, parent2: dst2},
+		Destination:      s.Peer().Name,
+	}
+	flowConnConfig := connectionGen.GenerateFlowConnectionConfigs(s)
+	flowConnConfig.DoInitialSnapshot = true
+
+	tc := NewTemporalClient(s.t)
+	env := ExecutePeerflow(s.t, tc, flowConnConfig)
+	SetupCDCFlowStatusQuery(s.t, env, flowConnConfig)
+	EnvWaitForEqualTablesWithNames(env, s, "waiting on initial p1", parent1Name, dst1, "id,name")
+	EnvWaitForEqualTablesWithNames(env, s, "waiting on initial p2", parent2Name, dst2, "id,name")
+
+	// created after start, so the first rows go through runtime discovery; inhseqno 1 is parent1
+	s.inhExec(`CREATE TABLE %s.inh_multi_child (id BIGINT PRIMARY KEY, name TEXT) INHERITS (%s, %s)`,
+		schemaM, parent1, parent2)
+	s.inhExec(`ALTER PUBLICATION %s ADD TABLE %s.inh_multi_child`, connpostgres.GetDefaultPublicationName(flowJobName), schemaM)
+	s.inhExec(`INSERT INTO %s.inh_multi_child (id, name) VALUES (10, 'm10')`, schemaM)
+	s.inhExec(`INSERT INTO %s (id, name) VALUES (3, 'p1-3')`, parent1)
+	s.inhExec(`INSERT INTO %s (id, name) VALUES (4, 'p2-4')`, parent2)
+
+	// parent1's source rows include the child's, parent2's destination must only hold parent2's own rows
+	EnvWaitForEqualTablesWithNames(env, s, "child routed to first parent", parent1Name, dst1, "id,name")
+	EnvWaitForEqualTablesWithNames_Only(env, s, "child not routed to second parent", parent2Name, dst2, "id,name")
+
+	// after a restart the child comes from the startup map instead, and must still go to parent1
+	s.inhRestartReplication(env, flowJobName)
+	s.inhExec(`INSERT INTO %s.inh_multi_child (id, name) VALUES (11, 'm11')`, schemaM)
+	s.inhExec(`UPDATE %s.inh_multi_child SET name = 'm10-upd' WHERE id = 10`, schemaM)
+	s.inhExec(`INSERT INTO %s (id, name) VALUES (5, 'p2-5')`, parent2)
+
+	EnvWaitForEqualTablesWithNames(env, s, "child still routed to first parent", parent1Name, dst1, "id,name")
+	EnvWaitForEqualTablesWithNames_Only(env, s, "child still not routed to second parent", parent2Name, dst2, "id,name")
 
 	env.Cancel(s.t.Context())
 	RequireEnvCanceled(s.t, env)

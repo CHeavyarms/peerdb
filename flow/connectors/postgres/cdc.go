@@ -57,7 +57,14 @@ type PostgresCDCSource struct {
 	// for partitioned tables, maps child relid to parent relid
 	childToParentRelIDMapping map[uint32]uint32
 	idToRelKindMap            map[uint32]byte
-	publishViaPartitionRoot   bool
+	// relids of the tables in the mirror, the only candidates a child can be remapped to
+	mirroredRelIDs          []uint32
+	publishViaPartitionRoot bool
+
+	// columns already emitted as schema deltas during this pull, keyed by destination table and column, so
+	// the RelationMessages of many inheritance children carrying the same column produce a single delta
+	emittedAddedColumns map[string]addedColumnType
+	warnedColumnEvents  map[string]struct{}
 
 	// for storing schema delta audit logs to catalog
 	catalogPool                              shared.CatalogPool
@@ -133,9 +140,9 @@ func (c *PostgresConnector) queryPostgresClockOffset(ctx context.Context) (time.
 
 // Create a new PostgresCDCSource
 func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig *PostgresCDCConfig) (*PostgresCDCSource, error) {
+	mirroredRelIDs := slices.Collect(maps.Keys(cdcConfig.SrcTableIDNameMapping))
 	childToParentRelIDMap, idToRelKindMap, err := getChildToParentRelIDMap(ctx,
-		c.conn, slices.Collect(maps.Keys(cdcConfig.SrcTableIDNameMapping)),
-		cdcConfig.HandleInheritanceForNonPartitionedTables)
+		c.conn, mirroredRelIDs, cdcConfig.HandleInheritanceForNonPartitionedTables)
 	if err != nil {
 		return nil, fmt.Errorf("error getting child to parent relid map: %w", err)
 	}
@@ -174,6 +181,9 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		commitLock:                               nil,
 		childToParentRelIDMapping:                childToParentRelIDMap,
 		idToRelKindMap:                           idToRelKindMap,
+		mirroredRelIDs:                           mirroredRelIDs,
+		emittedAddedColumns:                      make(map[string]addedColumnType),
+		warnedColumnEvents:                       make(map[string]struct{}),
 		publishViaPartitionRoot:                  publishViaPartitionRoot,
 		catalogPool:                              cdcConfig.CatalogPool,
 		alerter:                                  alerting.NewAlerter(ctx, cdcConfig.CatalogPool, cdcConfig.OtelManager),
@@ -204,23 +214,42 @@ func (p *PostgresCDCSource) getSourceSchemaForDestinationColumn(relID uint32, ta
 	return schemaTable.Namespace, nil
 }
 
+// inheritanceParentRelkinds lists the relkinds a parent may have for its children to be remapped onto it:
+// partitioned tables always, plain tables only when inheritance handling is enabled.
+func inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables bool) string {
+	if handleInheritanceForNonPartitionedTables {
+		return "'p', 'r'"
+	}
+	return "'p'"
+}
+
+// childToParentRelIDMapQuery and inheritedParentQuery must agree on which parent a child is remapped to:
+// candidates are the mirrored tables ($1 / $2) with a qualifying relkind, and the one with the lowest
+// inhseqno wins. The startup map and runtime discovery would otherwise route a child of several mirrored
+// parents differently across pulls.
+func childToParentRelIDMapQuery(handleInheritanceForNonPartitionedTables bool) string {
+	return fmt.Sprintf(`
+		SELECT DISTINCT ON (i.inhrelid) i.inhparent AS parentrelid, i.inhrelid AS childrelid, parent.relkind
+		FROM pg_inherits i
+		JOIN pg_class parent ON i.inhparent = parent.oid
+		WHERE parent.relkind IN (%s) AND i.inhparent = ANY($1)
+		ORDER BY i.inhrelid, i.inhseqno`, inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables))
+}
+
+func inheritedParentQuery(handleInheritanceForNonPartitionedTables bool) string {
+	return fmt.Sprintf(`
+		SELECT i.inhparent, parent.relkind
+		FROM pg_inherits i
+		JOIN pg_class parent ON i.inhparent = parent.oid
+		WHERE i.inhrelid = $1 AND parent.relkind IN (%s) AND i.inhparent = ANY($2)
+		ORDER BY i.inhseqno
+		LIMIT 1`, inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables))
+}
+
 func getChildToParentRelIDMap(ctx context.Context,
 	conn *pgx.Conn, parentTableOIDs []uint32, handleInheritanceForNonPartitionedTables bool,
 ) (map[uint32]uint32, map[uint32]byte, error) {
-	relkinds := "'p'"
-	if handleInheritanceForNonPartitionedTables {
-		relkinds = "'p', 'r'"
-	}
-
-	query := fmt.Sprintf(`
-		SELECT parent.oid AS parentrelid, child.oid AS childrelid, parent.relkind
-		FROM pg_inherits
-		JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
-		JOIN pg_class child ON pg_inherits.inhrelid = child.oid
-		WHERE parent.relkind IN (%s) AND parent.oid=ANY($1);
-	`, relkinds)
-
-	rows, err := conn.Query(ctx, query, parentTableOIDs)
+	rows, err := conn.Query(ctx, childToParentRelIDMapQuery(handleInheritanceForNonPartitionedTables), parentTableOIDs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error querying for child to parent relid map: %w", err)
 	}
@@ -1396,13 +1425,54 @@ func processRelationMessage[Items model.Items](
 		return !isExcluded
 	}
 
-	addedColumnNames := make([]string, 0)
-	addedColumnTypeOIDs := make([]uint32, 0)
+	// Every inheritance child carrying a column the destination schema lacks reports it, and the
+	// destination schema is only refreshed between pulls. Emit each column once per pull: a repeat with
+	// the same type is dropped silently, a repeat with a different type keeps the first (as replaying
+	// against the persisted schema would) and is reported. Only the delta is suppressed, never records.
+	addedColumns := make([]pglogrepl.RelationMessageColumn, 0)
 	for _, column := range currRel.Columns {
-		if isAddedColumnAndNotExcluded(column.Name) {
-			addedColumnNames = append(addedColumnNames, column.Name)
-			addedColumnTypeOIDs = append(addedColumnTypeOIDs, column.DataType)
+		if !isAddedColumnAndNotExcluded(column.Name) {
+			continue
 		}
+		colType := addedColumnType{typ: currRelMap[column.Name], typmod: column.TypeModifier}
+		prevType, emitted := p.emittedAddedColumns[schemaDelta.DstTableName+"\x00"+column.Name]
+		if !emitted {
+			addedColumns = append(addedColumns, *column)
+		} else if prevType == colType {
+			p.logger.Debug("added column already emitted in this pull, skipping",
+				slog.String("columnName", column.Name),
+				slog.String("relationName", schemaDelta.SrcTableName),
+				slog.String("childNamespace", currRel.Namespace),
+				slog.String("childRelationName", currRel.RelationName))
+		} else {
+			key := fmt.Sprintf("%s.%s.%s(%d).%s(%d)", schemaDelta.SrcTableName, column.Name,
+				prevType.typ, prevType.typmod, colType.typ, colType.typmod)
+			if _, ok := p.warnedTypeChanges.LoadOrStore(key, struct{}{}); !ok {
+				p.logger.Warn("added column type conflicts with the same column added by another relation, not propagating",
+					slog.String("table", schemaDelta.SrcTableName),
+					slog.String("column", column.Name),
+					slog.String("emittedType", prevType.typ),
+					slog.Int("emittedTypeModifier", int(prevType.typmod)),
+					slog.String("type", colType.typ),
+					slog.Int("typeModifier", int(colType.typmod)),
+					slog.String("childNamespace", currRel.Namespace),
+					slog.String("childRelationName", currRel.RelationName),
+					slog.String("event", otel_metrics.SourceEventTypeEventMetadata),
+				)
+				p.otelManager.Metrics.ColumnTypeChangesCounter.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(
+					attribute.String(otel_metrics.TypeChangeFromKey, prevType.typ),
+					attribute.String(otel_metrics.TypeChangeToKey, colType.typ),
+					attribute.String(otel_metrics.SourceEventTypeKey, otel_metrics.SourceEventTypeEventMetadata),
+				)))
+			}
+		}
+	}
+
+	addedColumnNames := make([]string, 0, len(addedColumns))
+	addedColumnTypeOIDs := make([]uint32, 0, len(addedColumns))
+	for _, column := range addedColumns {
+		addedColumnNames = append(addedColumnNames, column.Name)
+		addedColumnTypeOIDs = append(addedColumnTypeOIDs, column.DataType)
 	}
 
 	typeSchemaNameMapping, err := p.GetSchemaNameOfColumnTypeByOID(ctx, addedColumnTypeOIDs)
@@ -1420,67 +1490,77 @@ func processRelationMessage[Items model.Items](
 		return nil, err
 	}
 
-	for _, column := range currRel.Columns {
-		// not present in previous relation message, but in current one, so added.
-		if isAddedColumnAndNotExcluded(column.Name) {
-			catalogInfo := addedColumnCatalogInfo[column.Name]
-			sourceMissingValue := ""
-			if catalogInfo.missingValue != nil {
-				sourceMissingValue = *catalogInfo.missingValue
+	for _, column := range addedColumns {
+		catalogInfo := addedColumnCatalogInfo[column.Name]
+		sourceMissingValue := ""
+		if catalogInfo.missingValue != nil {
+			sourceMissingValue = *catalogInfo.missingValue
+		}
+		var defaultExpr *string
+		// destinations on the PG type system splice the column type in verbatim, so a literal
+		// rendered for a QValueKind would not fit their DDL
+		if catalogInfo.missingValue != nil && prevSchema.System == protos.TypeSystem_Q {
+			if literal, ok := defaultExprFromPostgresMissingValue(
+				*catalogInfo.missingValue, types.QValueKind(currRelMap[column.Name]),
+			); ok {
+				defaultExpr = &literal
 			}
-			var defaultExpr *string
-			// destinations on the PG type system splice the column type in verbatim, so a literal
-			// rendered for a QValueKind would not fit their DDL
-			if catalogInfo.missingValue != nil && prevSchema.System == protos.TypeSystem_Q {
-				if literal, ok := defaultExprFromPostgresMissingValue(
-					*catalogInfo.missingValue, types.QValueKind(currRelMap[column.Name]),
-				); ok {
-					defaultExpr = &literal
+		}
+		addedColumn := &protos.FieldDescription{
+			Name:           column.Name,
+			Type:           currRelMap[column.Name],
+			TypeModifier:   column.TypeModifier,
+			Nullable:       !catalogInfo.notNull,
+			TypeSchemaName: typeSchemaNameMapping[column.DataType],
+			DefaultExpr:    defaultExpr,
+		}
+		schemaDelta.AddedColumns = append(schemaDelta.AddedColumns, addedColumn)
+		p.emittedAddedColumns[schemaDelta.DstTableName+"\x00"+column.Name] = addedColumnType{
+			typ: addedColumn.Type, typmod: addedColumn.TypeModifier,
+		}
+		p.logger.Info("Detected added column",
+			slog.String("columnName", addedColumn.Name),
+			slog.String("columnType", addedColumn.Type),
+			slog.Bool("nullable", addedColumn.Nullable),
+			slog.Bool("sourceHasMissing", catalogInfo.hasMissing),
+			slog.String("sourceMissingValue", sourceMissingValue),
+			slog.String("default", addedColumn.GetDefaultExpr()),
+			slog.String("relationName", schemaDelta.SrcTableName),
+			slog.String("sourceNamespace", currRel.Namespace),
+			slog.String("sourceRelationName", currRel.RelationName))
+	}
+
+	for _, column := range currRel.Columns {
+		if _, inPrevRel := prevRelMap[column.Name]; inPrevRel {
+			if prevRelMap[column.Name] != currRelMap[column.Name] {
+				key := fmt.Sprintf("%s.%s.%s.%s", schemaDelta.SrcTableName, column.Name,
+					prevRelMap[column.Name], currRelMap[column.Name])
+				if _, ok := p.warnedTypeChanges.LoadOrStore(key, struct{}{}); !ok {
+					p.logger.Warn("column type change detected, not propagating",
+						slog.String("table", schemaDelta.SrcTableName),
+						slog.String("column", column.Name),
+						slog.String("from", prevRelMap[column.Name]),
+						slog.String("to", currRelMap[column.Name]),
+						slog.String("event", otel_metrics.SourceEventTypeEventMetadata),
+					)
+					p.otelManager.Metrics.ColumnTypeChangesCounter.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(
+						attribute.String(otel_metrics.TypeChangeFromKey, prevRelMap[column.Name]),
+						attribute.String(otel_metrics.TypeChangeToKey, currRelMap[column.Name]),
+						attribute.String(otel_metrics.SourceEventTypeKey, otel_metrics.SourceEventTypeEventMetadata),
+					)))
 				}
 			}
-			addedColumn := &protos.FieldDescription{
-				Name:           column.Name,
-				Type:           currRelMap[column.Name],
-				TypeModifier:   column.TypeModifier,
-				Nullable:       !catalogInfo.notNull,
-				TypeSchemaName: typeSchemaNameMapping[column.DataType],
-				DefaultExpr:    defaultExpr,
-			}
-			schemaDelta.AddedColumns = append(schemaDelta.AddedColumns, addedColumn)
-			p.logger.Info("Detected added column",
-				slog.String("columnName", addedColumn.Name),
-				slog.String("columnType", addedColumn.Type),
-				slog.Bool("nullable", addedColumn.Nullable),
-				slog.Bool("sourceHasMissing", catalogInfo.hasMissing),
-				slog.String("sourceMissingValue", sourceMissingValue),
-				slog.String("default", addedColumn.GetDefaultExpr()),
-				slog.String("relationName", schemaDelta.SrcTableName))
-		} else if _, inPrevRel := prevRelMap[column.Name]; !inPrevRel {
-			// Column is added but excluded
-			p.logger.Warn(fmt.Sprintf("Detected added column %s in table %s, but not propagating because excluded",
-				column.Name, schemaDelta.SrcTableName))
-		} else if prevRelMap[column.Name] != currRelMap[column.Name] {
-			key := fmt.Sprintf("%s.%s.%s.%s", schemaDelta.SrcTableName, column.Name,
-				prevRelMap[column.Name], currRelMap[column.Name])
-			if _, ok := p.warnedTypeChanges.LoadOrStore(key, struct{}{}); !ok {
-				p.logger.Warn("column type change detected, not propagating",
-					slog.String("table", schemaDelta.SrcTableName),
-					slog.String("column", column.Name),
-					slog.String("from", prevRelMap[column.Name]),
-					slog.String("to", currRelMap[column.Name]),
-					slog.String("event", otel_metrics.SourceEventTypeEventMetadata),
-				)
-				p.otelManager.Metrics.ColumnTypeChangesCounter.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(
-					attribute.String(otel_metrics.TypeChangeFromKey, prevRelMap[column.Name]),
-					attribute.String(otel_metrics.TypeChangeToKey, currRelMap[column.Name]),
-					attribute.String(otel_metrics.SourceEventTypeKey, otel_metrics.SourceEventTypeEventMetadata),
-				)))
+		} else if _, isExcluded := currRelDstInfo.Exclude[column.Name]; isExcluded {
+			if p.warnColumnEventOnce("excluded", schemaDelta.DstTableName, column.Name) {
+				p.logger.Warn(fmt.Sprintf("Detected added column %s in table %s, but not propagating because excluded",
+					column.Name, schemaDelta.SrcTableName))
 			}
 		}
 	}
 	for _, column := range prevSchema.Columns {
-		// present in previous relation message, but not in current one, so dropped.
-		if _, ok := currRelMap[column.Name]; !ok {
+		// present in previous relation message, but not in current one, so dropped. Inheritance children
+		// that lack a column only some of their siblings have report the same thing, so warn once per pull.
+		if _, ok := currRelMap[column.Name]; !ok && p.warnColumnEventOnce("dropped", schemaDelta.DstTableName, column.Name) {
 			p.logger.Warn(fmt.Sprintf("Detected dropped column %s in table %s, but not propagating", column,
 				schemaDelta.SrcTableName))
 		}
@@ -1494,6 +1574,23 @@ func processRelationMessage[Items model.Items](
 		}, monitoring.AuditSchemaDelta(ctx, p.catalogPool.Pool, p.flowJobName, schemaDelta)
 	}
 	return nil, nil
+}
+
+// warnColumnEventOnce reports whether this is the first time in the pull that event was seen for column of
+// dstTable, so warnings repeated by every inheritance child are logged once.
+func (p *PostgresCDCSource) warnColumnEventOnce(event string, dstTable string, column string) bool {
+	key := event + "\x00" + dstTable + "\x00" + column
+	if _, ok := p.warnedColumnEvents[key]; ok {
+		return false
+	}
+	p.warnedColumnEvents[key] = struct{}{}
+	return true
+}
+
+// addedColumnType identifies an added column's destination type for deduplication across relations.
+type addedColumnType struct {
+	typ    string
+	typmod int32
 }
 
 type addedColumnCatalogInfo struct {
@@ -1666,26 +1763,26 @@ func (p *PostgresCDCSource) checkIfUnknownTableInherits(ctx context.Context,
 	relID uint32,
 ) (uint32, byte, error) {
 	relID = p.getParentRelIDIfPartitioned(relID)
-	relkinds := "'p'"
-	if p.handleInheritanceForNonPartitionedTables {
-		relkinds = "'p', 'r'"
-	}
 
+	// Relations with no mirrored parent are looked up again on each of their RelationMessages (before their
+	// first change in a session, and after DDL or cache invalidation), as before. Caching the miss across
+	// sessions could hide a later ALTER TABLE ... INHERIT.
 	if _, ok := p.srcTableIDNameMapping[relID]; !ok {
 		var parentRelID uint32
+		var parentRelKind byte
 		if err := p.conn.QueryRow(
 			ctx,
-			fmt.Sprintf(`SELECT inhparent FROM pg_inherits
-			JOIN pg_class c ON pg_inherits.inhparent=c.oid
-			WHERE inhrelid=$1 AND c.relkind IN (%s)`, relkinds),
-			relID,
-		).Scan(&parentRelID); err != nil {
+			inheritedParentQuery(p.handleInheritanceForNonPartitionedTables),
+			relID, p.mirroredRelIDs,
+		).Scan(&parentRelID, &parentRelKind); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return relID, 0, nil
 			}
 			return 0, 0, fmt.Errorf("failed to query pg_inherits: %w", err)
 		}
 		p.childToParentRelIDMapping[relID] = parentRelID
+		// the parent may have had no children when the startup map was built
+		p.idToRelKindMap[parentRelID] = parentRelKind
 		p.hushWarnUnknownTableDetected[relID] = struct{}{}
 		p.logger.Info("Detected new child table in CDC stream, remapping to parent table",
 			slog.Uint64("childRelID", uint64(relID)),
