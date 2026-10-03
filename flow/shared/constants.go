@@ -45,6 +45,11 @@ const (
 	// inserting into ClickHouse. Otherwise inference is indeterministic depending on initial
 	// input data, and can silently corrupts out-of-range values (e,g, pre-1970 date becomes 1970-01-01).
 	InternalVersion_AlwaysUseDateTime64Inference
+	// Postgres: with PEERDB_SOURCE_SCHEMA_AS_DESTINATION_COLUMN, rows from table-inheritance children are stamped
+	// with the child's schema instead of the mirrored parent's, in both CDC and the initial snapshot. Gated because
+	// _peerdb_source_schema is the first ClickHouse ORDER BY column: changing its value under an existing mirror
+	// would stop updates and deletes from collapsing onto rows synced before the upgrade.
+	InternalVersion_SourceSchemaFromInheritanceChild
 
 	TotalNumberOfInternalVersions
 	InternalVersion_Latest = TotalNumberOfInternalVersions - 1
