@@ -833,9 +833,121 @@ func (c *PostgresConnector) SetupReplication(
 	})
 	defer stopSlotCreateWarning()
 
+	c.warnUnreplicatedInheritanceDescendants(ctx, catalogPool, req)
+
 	// Create the replication slot and publication
 	return c.createSlotAndPublication(ctx, exists, slotName, publicationName, tableNameMapping,
 		req.DoInitialSnapshot, skipSnapshotExport, req.Env)
+}
+
+// unreplicatedInheritanceDescendantsQuery finds mirrored plain tables ($1 schemas, $2 names) with
+// inheritance grandchildren reached through an unmirrored child. CDC only remaps direct children of mirrored
+// tables, so changes to those grandchildren are not replicated, while the initial snapshot includes them.
+const unreplicatedInheritanceDescendantsQuery = `
+	WITH mirrored AS (
+		SELECT c.oid
+		FROM unnest($1::text[], $2::text[]) AS t(nspname, relname)
+		JOIN pg_catalog.pg_namespace n ON n.nspname = t.nspname
+		JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.relname
+	)
+	SELECT DISTINCT pn.nspname, p.relname
+	FROM mirrored m
+	JOIN pg_catalog.pg_class p ON p.oid = m.oid AND p.relkind = 'r'
+	JOIN pg_catalog.pg_namespace pn ON pn.oid = p.relnamespace
+	JOIN pg_catalog.pg_inherits child ON child.inhparent = p.oid
+	JOIN pg_catalog.pg_inherits grandchild ON grandchild.inhparent = child.inhrelid
+	WHERE child.inhrelid NOT IN (SELECT oid FROM mirrored)
+	ORDER BY 1, 2`
+
+// unreplicatedInheritanceDescendantWarnings returns a warning for each of tables whose inheritance hierarchy is
+// deeper than CDC replicates.
+func (c *PostgresConnector) unreplicatedInheritanceDescendantWarnings(
+	ctx context.Context, env map[string]string, tables []*common.QualifiedTable,
+) ([]error, error) {
+	handleInheritance, err := internal.PeerDBPostgresCDCHandleInheritanceForNonPartitionedTables(ctx, env)
+	if err != nil || !handleInheritance {
+		return nil, err
+	}
+	schemas, names := splitQualifiedTables(tables)
+	rows, err := c.conn.Query(ctx, unreplicatedInheritanceDescendantsQuery, schemas, names)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check inheritance hierarchy depth: %w", err)
+	}
+	var warnings []error
+	var schema, table string
+	if _, err := pgx.ForEachRow(rows, []any{&schema, &table}, func() error {
+		warnings = append(warnings, fmt.Errorf("table %s.%s has inheritance descendants more than one level deep: "+
+			"the initial snapshot includes them, but CDC only replicates changes to its direct children, "+
+			"so later changes to deeper descendants will not be replicated", schema, table))
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to check inheritance hierarchy depth: %w", err)
+	}
+	return warnings, nil
+}
+
+// warnUnreplicatedInheritanceDescendants records a flow warning for each mirrored table whose inheritance
+// hierarchy is deeper than CDC replicates. It never fails setup.
+func (c *PostgresConnector) warnUnreplicatedInheritanceDescendants(
+	ctx context.Context,
+	catalogPool shared.CatalogPool,
+	req *protos.SetupReplicationInput,
+) {
+	tables := make([]*common.QualifiedTable, 0, len(req.TableNameMapping))
+	for srcTable := range req.TableNameMapping {
+		parsed, err := common.ParseTableIdentifier(srcTable)
+		if err != nil {
+			c.logger.Warn("failed to parse source table for inheritance check", slog.String("table", srcTable), slog.Any("error", err))
+			return
+		}
+		tables = append(tables, parsed)
+	}
+
+	warnings, err := c.unreplicatedInheritanceDescendantWarnings(ctx, req.Env, tables)
+	if err != nil {
+		c.logger.Warn("failed to check inheritance hierarchy depth", slog.Any("error", err))
+		return
+	}
+	for _, warning := range warnings {
+		if err := alerting.InsertFlowLog(ctx, catalogPool, req.FlowJobName, warning.Error(), alerting.FlowErrorTypeWarn); err != nil {
+			c.logger.Error("failed to insert inheritance depth warning", slog.Any("error", err))
+		}
+	}
+}
+
+// ValidateTableAdditions checks tables about to be added to a running mirror, before the publication changes,
+// and returns warnings to record for them. Table additions skip replication setup, which reports these for a new
+// mirror.
+func (c *PostgresConnector) ValidateTableAdditions(
+	ctx context.Context, cfg *protos.FlowConnectionConfigsCore, additionalTables []*protos.TableMapping,
+) ([]error, error) {
+	added, err := parseSourceTables(additionalTables)
+	if err != nil {
+		return nil, err
+	}
+	return c.unreplicatedInheritanceDescendantWarnings(ctx, cfg.Env, added)
+}
+
+func parseSourceTables(mappings []*protos.TableMapping) ([]*common.QualifiedTable, error) {
+	tables := make([]*common.QualifiedTable, 0, len(mappings))
+	for _, tm := range mappings {
+		parsed, err := common.ParseTableIdentifier(tm.SourceTableIdentifier)
+		if err != nil {
+			return nil, fmt.Errorf("invalid source table identifier %s: %w", tm.SourceTableIdentifier, err)
+		}
+		tables = append(tables, parsed)
+	}
+	return tables, nil
+}
+
+func splitQualifiedTables(tables []*common.QualifiedTable) ([]string, []string) {
+	schemas := make([]string, 0, len(tables))
+	names := make([]string, 0, len(tables))
+	for _, table := range tables {
+		schemas = append(schemas, table.Namespace)
+		names = append(names, table.Table)
+	}
+	return schemas, names
 }
 
 func (c *PostgresConnector) PullFlowCleanup(ctx context.Context, jobName string) error {

@@ -156,7 +156,8 @@ childToParentRelIDMapping map[uint32]uint32  // child relid → parent relid
 when an unknown relation ID appears, ensuring child events are attributed to the parent's table mapping. Both
 use the same rule: the candidates are mirrored tables with a qualifying relkind, and the one with the lowest
 `pg_inherits.inhseqno` wins, so a child of several mirrored tables always goes to the same one. Only direct
-children are remapped; deeper descendants are not replicated by CDC although the initial snapshot includes them.
+children are remapped; deeper descendants are not replicated by CDC although the initial snapshot includes them,
+which replication setup and table additions report as a flow warning.
 
 **Column layouts are per relation.** A child's tuples follow the child's own column order, which can differ from
 the parent's and from its siblings (`ALTER TABLE ... INHERIT` only requires matching names and types, and a
