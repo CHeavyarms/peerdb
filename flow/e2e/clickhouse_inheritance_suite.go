@@ -311,6 +311,52 @@ func (s ClickHouseSuite) Test_Inheritance_Child_Of_Two_Mirrored_Parents() {
 	RequireEnvCanceled(s.t, env)
 }
 
+func (s ClickHouseSuite) Test_Inheritance_Grandchildren_Warning() {
+	s.inhRequirePostgres()
+
+	srcTableName := "inh_deep"
+	parent := s.attachSchemaSuffix(srcTableName)
+	dstTableName := "inh_deep_dst"
+	flowJobName := s.attachSuffix("inh_deep")
+
+	s.inhExec(`CREATE TABLE %s (id BIGINT PRIMARY KEY, name TEXT)`, parent)
+	s.inhExec(`CREATE TABLE %s_child () INHERITS (%s)`, parent, parent)
+	s.inhExec(`CREATE TABLE %s_grandchild () INHERITS (%s_child)`, parent, parent)
+	s.inhExec(`INSERT INTO %s (id, name) VALUES (1, 'p')`, parent)
+	s.inhExec(`INSERT INTO %s_child (id, name) VALUES (2, 'c')`, parent)
+	s.inhExec(`INSERT INTO %s_grandchild (id, name) VALUES (3, 'g')`, parent)
+
+	connectionGen := FlowConnectionGenerationConfig{
+		FlowJobName:      flowJobName,
+		TableNameMapping: map[string]string{parent: dstTableName},
+		Destination:      s.Peer().Name,
+	}
+	flowConnConfig := connectionGen.GenerateFlowConnectionConfigs(s)
+	flowConnConfig.DoInitialSnapshot = true
+
+	tc := NewTemporalClient(s.t)
+	env := ExecutePeerflow(s.t, tc, flowConnConfig)
+	SetupCDCFlowStatusQuery(s.t, env, flowConnConfig)
+	EnvWaitForEqualTablesWithNames(env, s, "snapshot includes the grandchild", srcTableName, dstTableName, "id,name")
+
+	EnvWaitFor(s.t, env, time.Minute, "grandchild warning recorded", func() bool {
+		count, err := GetLogCount(s.t.Context(), s.Catalog(), flowJobName, "warn", "more than one level deep")
+		if err != nil {
+			s.t.Log(err)
+			return false
+		}
+		// deduplicated per connector, so a retried activity or restarted sync can record it again
+		return count >= 1
+	})
+
+	// the mirror keeps running for the direct child
+	s.inhExec(`INSERT INTO %s_child (id, name) VALUES (4, 'c4')`, parent)
+	EnvWaitForCount(env, s, "cdc from the direct child", dstTableName, "id", 4)
+
+	env.Cancel(s.t.Context())
+	RequireEnvCanceled(s.t, env)
+}
+
 func (s ClickHouseSuite) inhPartitionDivergentLayout(pubViaRoot bool) {
 	s.inhRequirePostgres()
 
