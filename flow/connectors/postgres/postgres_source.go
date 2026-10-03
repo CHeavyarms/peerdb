@@ -1095,12 +1095,16 @@ func (c *PostgresConnector) warnOverlappingInheritanceMappings(
 
 // ValidateTableAdditions checks tables about to be added to a running mirror, before the publication changes,
 // and returns warnings to record for them: overlaps between the mirror's tables, existing and added, that an added
-// table takes part in. Table additions skip replication setup, which reports these for a new mirror.
+// table takes part in. Table additions skip mirror validation and replication setup, which perform these checks for
+// a new mirror.
 func (c *PostgresConnector) ValidateTableAdditions(
 	ctx context.Context, cfg *protos.FlowConnectionConfigsCore, additionalTables []*protos.TableMapping,
 ) ([]error, error) {
 	added, err := parseSourceTables(additionalTables)
 	if err != nil {
+		return nil, err
+	}
+	if err := c.checkReservedSourceSchemaColumn(ctx, cfg.Env, added); err != nil {
 		return nil, err
 	}
 	existing, err := parseSourceTables(cfg.TableMappings)

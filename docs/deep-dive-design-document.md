@@ -181,6 +181,11 @@ already written. If a mirror has children with different column orders, resync t
 destination table. The initial snapshot selects the parent's columns, so child-only columns are only populated by
 CDC.
 
+**Reserved source schema column.** While `PEERDB_SOURCE_SCHEMA_AS_DESTINATION_COLUMN` is on, validation rejects a
+source column named `_peerdb_source_schema` on mirrored tables and their descendants. One that appears later is not
+replicated, and a flow warning says how to recover its values; a child-only column needs a separate backfill,
+because snapshots read only the mirrored table's columns.
+
 ### 1.7 LSN Checkpoint Management
 
 **Storage**: Catalog (default) or destination peer (Postgres→Postgres optimization)
