@@ -261,6 +261,9 @@ func (c *PostgresConnector) ValidateMirrorSource(ctx context.Context, cfg *proto
 	if err := c.checkReservedSourceSchemaColumn(ctx, cfg.Env, sourceTables); err != nil {
 		return err
 	}
+	if err := c.checkInheritanceForChildSchema(ctx, cfg.Env, cfg.Version, sourceTables); err != nil {
+		return err
+	}
 
 	if pubName == "" && !noCDC {
 		srcTableNames := make([]string, 0, len(sourceTables))

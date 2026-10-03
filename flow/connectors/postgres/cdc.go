@@ -65,6 +65,8 @@ type PostgresCDCSource struct {
 	// the RelationMessages of many inheritance children carrying the same column produce a single delta
 	emittedAddedColumns map[string]addedColumnType
 	warnedColumnEvents  map[string]struct{}
+	// relations without a mirrored parent already checked for being deeper descendants during this pull
+	depthCheckedRelIDs map[uint32]struct{}
 
 	// for storing schema delta audit logs to catalog
 	catalogPool                              shared.CatalogPool
@@ -142,7 +144,7 @@ func (c *PostgresConnector) queryPostgresClockOffset(ctx context.Context) (time.
 // Create a new PostgresCDCSource
 func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig *PostgresCDCConfig) (*PostgresCDCSource, error) {
 	mirroredRelIDs := slices.Collect(maps.Keys(cdcConfig.SrcTableIDNameMapping))
-	childToParentRelIDMap, idToRelKindMap, err := getChildToParentRelIDMap(ctx,
+	childToParentRelIDMap, idToRelKindMap, multiParentChildren, err := getChildToParentRelIDMap(ctx,
 		c.conn, mirroredRelIDs, cdcConfig.HandleInheritanceForNonPartitionedTables)
 	if err != nil {
 		return nil, fmt.Errorf("error getting child to parent relid map: %w", err)
@@ -170,7 +172,7 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 
 	jsonApi := createExtendedJSONUnmarshaler()
 
-	return &PostgresCDCSource{
+	source := &PostgresCDCSource{
 		PostgresConnector:                        c,
 		srcTableIDNameMapping:                    cdcConfig.SrcTableIDNameMapping,
 		schemaNameForRelID:                       schemaNameForRelID,
@@ -185,6 +187,7 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		mirroredRelIDs:                           mirroredRelIDs,
 		emittedAddedColumns:                      make(map[string]addedColumnType),
 		warnedColumnEvents:                       make(map[string]struct{}),
+		depthCheckedRelIDs:                       make(map[uint32]struct{}),
 		publishViaPartitionRoot:                  publishViaPartitionRoot,
 		catalogPool:                              cdcConfig.CatalogPool,
 		alerter:                                  alerting.NewAlerter(ctx, cdcConfig.CatalogPool, cdcConfig.OtelManager),
@@ -198,13 +201,28 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		sourceSchemaAsDestinationColumn:          cdcConfig.SourceSchemaAsDestinationColumn,
 		originMetadataAsDestinationColumn:        cdcConfig.OriginMetaAsDestinationColumn,
 		internalVersion:                          cdcConfig.InternalVersion,
-	}, nil
+	}
+	// children found here never reach runtime discovery, so they are checked now
+	if source.checksInheritanceForChildSchema() {
+		for _, childRelID := range multiParentChildren {
+			source.warnMultiParentChild(ctx, childRelID, childToParentRelIDMap[childRelID])
+		}
+	}
+	return source, nil
 }
 
-func (p *PostgresCDCSource) getSourceSchemaForDestinationColumn(relID uint32, tableName string) (string, error) {
+// getSourceSchemaForDestinationColumn returns the value of _peerdb_source_schema for a tuple of rel, which is
+// mappedRelID (named tableName) or one of its children.
+func (p *PostgresCDCSource) getSourceSchemaForDestinationColumn(
+	rel *pglogrepl.RelationMessage, mappedRelID uint32, tableName string,
+) (string, error) {
 	if p.schemaNameForRelID == nil {
 		return "", nil
-	} else if schema, ok := p.schemaNameForRelID[relID]; ok {
+	}
+	if rel.RelationID != mappedRelID && p.stampsChildSchema(mappedRelID) {
+		return rel.Namespace, nil
+	}
+	if schema, ok := p.schemaNameForRelID[mappedRelID]; ok {
 		return schema, nil
 	}
 
@@ -212,8 +230,17 @@ func (p *PostgresCDCSource) getSourceSchemaForDestinationColumn(relID uint32, ta
 	if err != nil {
 		return "", err
 	}
-	p.schemaNameForRelID[relID] = schemaTable.Namespace
+	p.schemaNameForRelID[mappedRelID] = schemaTable.Namespace
 	return schemaTable.Namespace, nil
+}
+
+// stampsChildSchema reports whether rows of mappedRelID's inheritance children carry the child's own schema in
+// _peerdb_source_schema. The snapshot applies the same rule (snapshotSourceSchemaFor): plain-table parents only,
+// since declarative partitions published via their root arrive under the root's relid.
+func (p *PostgresCDCSource) stampsChildSchema(mappedRelID uint32) bool {
+	return p.sourceSchemaAsDestinationColumn && p.handleInheritanceForNonPartitionedTables &&
+		p.internalVersion >= shared.InternalVersion_SourceSchemaFromInheritanceChild &&
+		p.idToRelKindMap[mappedRelID] == 'r'
 }
 
 // warnRelationOnce records msg as a flow warning the first time key is seen by this connector.
@@ -242,16 +269,19 @@ func inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables bool) st
 // parents differently across pulls.
 func childToParentRelIDMapQuery(handleInheritanceForNonPartitionedTables bool) string {
 	return fmt.Sprintf(`
-		SELECT DISTINCT ON (i.inhrelid) i.inhparent AS parentrelid, i.inhrelid AS childrelid, parent.relkind
+		SELECT DISTINCT ON (i.inhrelid) i.inhparent AS parentrelid, i.inhrelid AS childrelid, parent.relkind,
+			count(*) OVER (PARTITION BY i.inhrelid) AS mirrored_parents
 		FROM pg_inherits i
 		JOIN pg_class parent ON i.inhparent = parent.oid
 		WHERE parent.relkind IN (%s) AND i.inhparent = ANY($1)
 		ORDER BY i.inhrelid, i.inhseqno`, inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables))
 }
 
+// inheritedParentQuery also counts the qualifying mirrored parents, so a child of several can be reported
+// without another round trip.
 func inheritedParentQuery(handleInheritanceForNonPartitionedTables bool) string {
 	return fmt.Sprintf(`
-		SELECT i.inhparent, parent.relkind
+		SELECT i.inhparent, parent.relkind, count(*) OVER () AS mirrored_parents
 		FROM pg_inherits i
 		JOIN pg_class parent ON i.inhparent = parent.oid
 		WHERE i.inhrelid = $1 AND parent.relkind IN (%s) AND i.inhparent = ANY($2)
@@ -259,27 +289,33 @@ func inheritedParentQuery(handleInheritanceForNonPartitionedTables bool) string 
 		LIMIT 1`, inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables))
 }
 
+// getChildToParentRelIDMap also returns the children of more than one mirrored table.
 func getChildToParentRelIDMap(ctx context.Context,
 	conn *pgx.Conn, parentTableOIDs []uint32, handleInheritanceForNonPartitionedTables bool,
-) (map[uint32]uint32, map[uint32]byte, error) {
+) (map[uint32]uint32, map[uint32]byte, []uint32, error) {
 	rows, err := conn.Query(ctx, childToParentRelIDMapQuery(handleInheritanceForNonPartitionedTables), parentTableOIDs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error querying for child to parent relid map: %w", err)
+		return nil, nil, nil, fmt.Errorf("error querying for child to parent relid map: %w", err)
 	}
 
 	childToParentRelIDMap := make(map[uint32]uint32)
 	idToRelKindMap := make(map[uint32]byte)
+	var multiParentChildren []uint32
 	var parentRelID, childRelID pgtype.Uint32
 	var relkind byte
-	if _, err := pgx.ForEachRow(rows, []any{&parentRelID, &childRelID, &relkind}, func() error {
+	var mirroredParents int64
+	if _, err := pgx.ForEachRow(rows, []any{&parentRelID, &childRelID, &relkind, &mirroredParents}, func() error {
 		childToParentRelIDMap[childRelID.Uint32] = parentRelID.Uint32
 		idToRelKindMap[parentRelID.Uint32] = relkind
+		if mirroredParents > 1 {
+			multiParentChildren = append(multiParentChildren, childRelID.Uint32)
+		}
 		return nil
 	}); err != nil {
-		return nil, nil, fmt.Errorf("error iterating over child to parent relid map: %w", err)
+		return nil, nil, nil, fmt.Errorf("error iterating over child to parent relid map: %w", err)
 	}
 
-	return childToParentRelIDMap, idToRelKindMap, nil
+	return childToParentRelIDMap, idToRelKindMap, multiParentChildren, nil
 }
 
 // replProcessor implements ingesting PostgreSQL logical replication tuples into items.
@@ -1217,7 +1253,7 @@ func processInsertMessage[Items model.Items](
 		return nil, err
 	}
 
-	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
+	schemaName, err := p.getSourceSchemaForDestinationColumn(rel, relID, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -1274,7 +1310,7 @@ func processUpdateMessage[Items model.Items](
 		return nil, err
 	}
 
-	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
+	schemaName, err := p.getSourceSchemaForDestinationColumn(rel, relID, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -1337,7 +1373,7 @@ func processDeleteMessage[Items model.Items](
 		return nil, err
 	}
 
-	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
+	schemaName, err := p.getSourceSchemaForDestinationColumn(rel, relID, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -1762,6 +1798,56 @@ func (p *PostgresCDCSource) getParentRelIDIfPartitioned(relID uint32) uint32 {
 	return relID
 }
 
+// checksInheritanceForChildSchema reports whether inheritance shapes that child schema stamping cannot handle
+// are reported at runtime (validation rejects them at mirror creation, but tables can change afterwards).
+func (p *PostgresCDCSource) checksInheritanceForChildSchema() bool {
+	return p.sourceSchemaAsDestinationColumn && p.handleInheritanceForNonPartitionedTables &&
+		p.internalVersion >= shared.InternalVersion_SourceSchemaFromInheritanceChild
+}
+
+// warnMultiParentChild reports a child of several mirrored tables, once per connector.
+func (p *PostgresCDCSource) warnMultiParentChild(ctx context.Context, childRelID uint32, parentRelID uint32) {
+	p.warnRelationOnce(ctx, fmt.Sprintf("multiparent\x00%d", childRelID), fmt.Sprintf(
+		"Relation %d inherits from more than one mirrored table. Its changes are replicated to %s only, and its "+
+			"rows cannot be stamped consistently with their own schema in _peerdb_source_schema.",
+		childRelID, p.srcTableIDNameMapping[parentRelID]))
+}
+
+// unreplicatedDescendantQuery reports whether relation $1 descends from a mirrored table ($2) through more than
+// one level of inheritance, which CDC does not replicate.
+const unreplicatedDescendantQuery = `
+	WITH RECURSIVE ancestors(relid, depth) AS (
+		SELECT inhparent, 1 FROM pg_catalog.pg_inherits WHERE inhrelid = $1
+		UNION
+		SELECT i.inhparent, a.depth + 1
+		FROM pg_catalog.pg_inherits i JOIN ancestors a ON i.inhrelid = a.relid
+		WHERE a.depth < 32
+	)
+	SELECT EXISTS (SELECT 1 FROM ancestors WHERE depth > 1 AND relid = ANY($2))`
+
+// warnIfUnreplicatedDescendant reports a relation with no mirrored parent that is a deeper descendant of a
+// mirrored table, when child schema stamping is in use.
+func (p *PostgresCDCSource) warnIfUnreplicatedDescendant(ctx context.Context, relID uint32) error {
+	if !p.checksInheritanceForChildSchema() {
+		return nil
+	}
+	// checked once per pull, like the parent lookup that found no mirrored parent
+	if _, checked := p.depthCheckedRelIDs[relID]; checked {
+		return nil
+	}
+	var deep bool
+	if err := p.conn.QueryRow(ctx, unreplicatedDescendantQuery, relID, p.mirroredRelIDs).Scan(&deep); err != nil {
+		return fmt.Errorf("failed to check inheritance depth of relation %d: %w", relID, err)
+	}
+	p.depthCheckedRelIDs[relID] = struct{}{}
+	if deep {
+		p.warnRelationOnce(ctx, fmt.Sprintf("deep\x00%d", relID), fmt.Sprintf(
+			"Relation %d descends from a mirrored table through more than one level of inheritance. "+
+				"Its changes are not replicated.", relID))
+	}
+	return nil
+}
+
 // relationMessageFor returns the layout to decode a tuple of relation tupleRelID with, keyed by the tuple's own
 // relid rather than the parent it is remapped to: siblings can order their columns differently, and pgoutput only
 // resends a RelationMessage after the relation's schema changes, so a shared entry would hold whichever sibling
@@ -1791,15 +1877,22 @@ func (p *PostgresCDCSource) checkIfUnknownTableInherits(ctx context.Context,
 	if _, ok := p.srcTableIDNameMapping[relID]; !ok {
 		var parentRelID uint32
 		var parentRelKind byte
+		var mirroredParents int64
 		if err := p.conn.QueryRow(
 			ctx,
 			inheritedParentQuery(p.handleInheritanceForNonPartitionedTables),
 			relID, p.mirroredRelIDs,
-		).Scan(&parentRelID, &parentRelKind); err != nil {
+		).Scan(&parentRelID, &parentRelKind, &mirroredParents); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				if err := p.warnIfUnreplicatedDescendant(ctx, relID); err != nil {
+					return 0, 0, err
+				}
 				return relID, 0, nil
 			}
 			return 0, 0, fmt.Errorf("failed to query pg_inherits: %w", err)
+		}
+		if mirroredParents > 1 && p.checksInheritanceForChildSchema() {
+			p.warnMultiParentChild(ctx, relID, parentRelID)
 		}
 		p.childToParentRelIDMapping[relID] = parentRelID
 		// the parent may have had no children when the startup map was built

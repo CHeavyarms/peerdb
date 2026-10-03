@@ -176,6 +176,14 @@ children get the type's default). Each column is emitted once per pull however m
 conflicting type is reported and not propagated. The initial snapshot selects the parent's columns, so child-only
 columns are only populated by CDC.
 
+**Source schema column.** With `PEERDB_SOURCE_SCHEMA_AS_DESTINATION_COLUMN`, mirrors created at
+`InternalVersion_SourceSchemaFromInheritanceChild` or later stamp rows of plain-table inheritance children with
+the child's schema, in CDC and in the initial snapshot (where the Postgres source adds it to each row: a literal
+when it reads one child table, or a map of the hierarchy's schemas joined on `tableoid` when it reads the parent;
+see `internal.SnapshotProjectsSourceSchema`); partition roots and older mirrors stamp the mirrored table's schema.
+Such mirrors reject hierarchies deeper than one level and children of several mirrored tables. Renaming or
+moving a child's schema changes the provenance key, which needs a resync of the table.
+
 **Reserved source schema column.** While `PEERDB_SOURCE_SCHEMA_AS_DESTINATION_COLUMN` is on, a source column
 named `_peerdb_source_schema` would be overwritten by the stamp, so source validation rejects it on mirrored tables
 and their direct children or partitions, including for resyncs and table additions, and ClickHouse validation

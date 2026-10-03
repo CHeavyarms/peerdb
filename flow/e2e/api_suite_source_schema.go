@@ -2,14 +2,16 @@ package e2e
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
+	"github.com/PeerDB-io/peerdb/flow/shared"
 )
 
 // Validation of mirrors using PEERDB_SOURCE_SCHEMA_AS_DESTINATION_COLUMN on Postgres sources: the column name it
-// adds is reserved.
+// adds is reserved, and stamping each inheritance child's schema needs single-level, single-parent hierarchies.
 
 func (s APITestSuite) sourceSchemaMirror(name string, tables ...string) *protos.FlowConnectionConfigs {
 	tableNameMapping := make(map[string]string, len(tables))
@@ -68,4 +70,38 @@ func (s APITestSuite) TestValidateCDCMirror_ReservedSourceSchemaColumn() {
 	plain.Env = map[string]string{}
 	_, err := s.ValidateCDCMirror(s.t.Context(), &protos.CreateCDCFlowRequest{ConnectionConfigs: plain})
 	require.NoError(s.t, err)
+}
+
+func (s APITestSuite) TestValidateCDCMirror_ChildSchemaInheritanceShape() {
+	if _, ok := s.source.(*PostgresSource); !ok {
+		s.t.Skip("only applies to postgres")
+	}
+	exec := func(format string, args ...any) {
+		require.NoError(s.t, s.source.Exec(s.t.Context(), fmt.Sprintf(format, args...)))
+	}
+
+	deep := AttachSchema(s, "shape_deep")
+	exec(`CREATE TABLE %s (id INT PRIMARY KEY, name TEXT)`, deep)
+	exec(`CREATE TABLE %s_child () INHERITS (%s)`, deep, deep)
+	exec(`CREATE TABLE %s_grandchild () INHERITS (%s_child)`, deep, deep)
+
+	p1, p2 := AttachSchema(s, "shape_p1"), AttachSchema(s, "shape_p2")
+	exec(`CREATE TABLE %s (id INT PRIMARY KEY, name TEXT)`, p1)
+	exec(`CREATE TABLE %s (id INT PRIMARY KEY, name TEXT)`, p2)
+	exec(`CREATE TABLE %s_shared () INHERITS (%s, %s)`, p1, p1, p2)
+
+	s.requireValidationError(s.sourceSchemaMirror("shape_deep", "shape_deep"), "has descendants more than one level deep")
+	s.requireValidationError(s.sourceSchemaMirror("shape_multi", "shape_p1", "shape_p2"),
+		"has a child that also inherits from another mirrored table")
+
+	// mirrors that keep stamping the parent's schema accept these shapes, as before
+	oldVersion := strconv.FormatUint(uint64(shared.InternalVersion_SourceSchemaFromInheritanceChild-1), 10)
+	for _, cfg := range []*protos.FlowConnectionConfigs{
+		s.sourceSchemaMirror("shape_deep_old", "shape_deep"),
+		s.sourceSchemaMirror("shape_multi_old", "shape_p1", "shape_p2"),
+	} {
+		cfg.Env["PEERDB_FORCE_INTERNAL_VERSION"] = oldVersion
+		_, err := s.ValidateCDCMirror(s.t.Context(), &protos.CreateCDCFlowRequest{ConnectionConfigs: cfg})
+		require.NoError(s.t, err)
+	}
 }

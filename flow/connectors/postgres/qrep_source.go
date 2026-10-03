@@ -332,7 +332,7 @@ func (c *PostgresConnector) PullQRepRecords(
 	partition *protos.QRepPartition,
 	stream *model.QRecordStream,
 ) (int64, int64, error) {
-	return corePullQRepRecords(c, ctx, config, partition, &RecordStreamSink{
+	return corePullQRepRecords(c, ctx, config, dstType, partition, &RecordStreamSink{
 		QRecordStream:   stream,
 		DestinationType: dstType,
 	})
@@ -343,17 +343,18 @@ func (c *PostgresConnector) PullPgQRepRecords(
 	_catalogPool shared.CatalogPool,
 	_otelManager *otel_metrics.OtelManager,
 	config *protos.QRepConfig,
-	_dstType protos.DBType,
+	dstType protos.DBType,
 	partition *protos.QRepPartition,
 	stream PgCopyWriter,
 ) (int64, int64, error) {
-	return corePullQRepRecords(c, ctx, config, partition, stream)
+	return corePullQRepRecords(c, ctx, config, dstType, partition, stream)
 }
 
 func corePullQRepRecords(
 	c *PostgresConnector,
 	ctx context.Context,
 	config *protos.QRepConfig,
+	dstType protos.DBType,
 	partition *protos.QRepPartition,
 	sink QRepPullSink,
 ) (int64, int64, error) {
@@ -370,7 +371,15 @@ func corePullQRepRecords(
 		return 0, 0, err
 	}
 
+	sourceSchema, err := c.snapshotSourceSchemaFor(ctx, config, dstType, parsedSrcTable)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// selectedColumns reads one table of the hierarchy (child ranges); tableColumns is the same list for the
+	// generated queries on the mirrored table itself, qualified when the source schema projection adds a FROM item
 	selectedColumns := "*"
+	tableColumns := "*"
 	if len(config.Exclude) != 0 || len(partition.ChildTableRanges) > 0 || sourceSchemaAsDestinationColumn {
 		excluded := config.Exclude
 		if sourceSchemaAsDestinationColumn {
@@ -392,6 +401,7 @@ func corePullQRepRecords(
 			quotedColumns = append(quotedColumns, common.QuoteIdentifier(col))
 		}
 		selectedColumns = strings.Join(quotedColumns, ",")
+		tableColumns = sourceSchema.tableColumns(columns)
 	}
 
 	if partition.FullTablePartition {
@@ -404,13 +414,14 @@ func corePullQRepRecords(
 
 		query := config.Query
 		if query == "" {
-			query = fmt.Sprintf("SELECT %s FROM %s", selectedColumns, parsedSrcTable.String())
+			query = fmt.Sprintf("SELECT %s FROM %s",
+				sourceSchema.tableSelectList(tableColumns), sourceSchema.fromClause(parsedSrcTable.String()))
 		}
 		return executor.ExecuteQueryIntoSink(ctx, sink, query)
 	}
 
 	if len(partition.ChildTableRanges) > 0 {
-		return pullChildTableRanges(c, ctx, config, partition, sink, selectedColumns)
+		return pullChildTableRanges(c, ctx, config, partition, sink, selectedColumns, sourceSchema)
 	}
 
 	c.logger.Info("Obtained ranges for partition for PullQRepStream", partitionIdLog)
@@ -421,7 +432,8 @@ func corePullQRepRecords(
 	queryTemplate := config.Query
 	if queryTemplate == "" {
 		queryTemplate = fmt.Sprintf("SELECT %s FROM %s WHERE %s BETWEEN {{.start}} AND {{.end}}",
-			selectedColumns, parsedSrcTable.String(), common.QuoteIdentifier(config.WatermarkColumn))
+			sourceSchema.tableSelectList(tableColumns), sourceSchema.fromClause(parsedSrcTable.String()),
+			sourceSchema.watermarkColumn(common.QuoteIdentifier(config.WatermarkColumn)))
 	}
 	templateParams := map[string]string{"start": "$1", "end": "$2"}
 
@@ -450,7 +462,8 @@ func corePullQRepRecords(
 		}
 		queryTemplate = fmt.Sprintf(
 			"SELECT %s FROM %s WHERE %s IS NULL",
-			selectedColumns, parsedSrcTable.String(), common.QuoteIdentifier(config.WatermarkColumn),
+			sourceSchema.tableSelectList(tableColumns), sourceSchema.fromClause(parsedSrcTable.String()),
+			sourceSchema.watermarkColumn(common.QuoteIdentifier(config.WatermarkColumn)),
 		)
 		templateParams = map[string]string{}
 	default:
@@ -495,6 +508,7 @@ func pullChildTableRanges(
 	partition *protos.QRepPartition,
 	sink QRepPullSink,
 	selectedColumns string,
+	sourceSchema snapshotSourceSchema,
 ) (int64, int64, error) {
 	partitionIdLog := slog.String(string(shared.PartitionIDKey), partition.PartitionId)
 
@@ -514,8 +528,10 @@ func pullChildTableRanges(
 		}
 
 		// ONLY excludes rows from child tables, ensuring we don't double-count inherited rows.
+		// Ranges of grandchildren get their own schema too; validation rejects such hierarchies when a mirror
+		// stamps child schemas, because CDC only replicates direct children.
 		query := fmt.Sprintf("SELECT %s FROM ONLY %s WHERE %s BETWEEN $1 AND $2",
-			selectedColumns, parsedChild.String(), quotedWatermarkColumn)
+			sourceSchema.childSelectList(selectedColumns, parsedChild.Namespace), parsedChild.String(), quotedWatermarkColumn)
 
 		rangeStart := pgtype.TID{
 			BlockNumber:  child.Start,
