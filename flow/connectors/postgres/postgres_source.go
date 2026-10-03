@@ -916,13 +916,16 @@ func (c *PostgresConnector) warnUnreplicatedInheritanceDescendants(
 }
 
 // ValidateTableAdditions checks tables about to be added to a running mirror, before the publication changes,
-// and returns warnings to record for them. Table additions skip replication setup, which reports these for a new
-// mirror.
+// and returns warnings to record for them. Table additions skip mirror validation and replication setup, which
+// perform these checks for a new mirror.
 func (c *PostgresConnector) ValidateTableAdditions(
 	ctx context.Context, cfg *protos.FlowConnectionConfigsCore, additionalTables []*protos.TableMapping,
 ) ([]error, error) {
 	added, err := parseSourceTables(additionalTables)
 	if err != nil {
+		return nil, err
+	}
+	if err := c.checkReservedSourceSchemaColumn(ctx, cfg.Env, added); err != nil {
 		return nil, err
 	}
 	return c.unreplicatedInheritanceDescendantWarnings(ctx, cfg.Env, added)

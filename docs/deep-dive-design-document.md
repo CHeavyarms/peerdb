@@ -176,6 +176,14 @@ children get the type's default). Each column is emitted once per pull however m
 conflicting type is reported and not propagated. The initial snapshot selects the parent's columns, so child-only
 columns are only populated by CDC.
 
+**Reserved source schema column.** While `PEERDB_SOURCE_SCHEMA_AS_DESTINATION_COLUMN` is on, a source column
+named `_peerdb_source_schema` would be overwritten by the stamp, so source validation rejects it on mirrored tables
+and their direct children or partitions, including for resyncs and table additions, and ClickHouse validation
+rejects renaming a column to it. One that appears later is not replicated (a flow warning says so). Renaming it
+lets CDC replicate future values under the new name; earlier values come back with a resync if the column is on
+the mirrored table, but a child-only column needs a separate backfill, because snapshots read only the mirrored
+table's columns.
+
 **Publication membership.** `CREATE PUBLICATION ... FOR TABLE parent` (without `ONLY`) includes the descendants
 that exist at that moment; unlike partitions, inheritance children created later are not added automatically.
 Add them with `ALTER PUBLICATION ... ADD TABLE child` when they are created, and CDC picks them up without
