@@ -152,8 +152,11 @@ relation IDs from the mirrored parent:
 childToParentRelIDMapping map[uint32]uint32  // child relid → parent relid
 ```
 
-`checkIfUnknownTableInherits()` translates child→parent when an unknown relation ID appears, ensuring child events
-are attributed to the parent's table mapping.
+`getChildToParentRelIDMap()` builds the map when a pull starts and `checkIfUnknownTableInherits()` extends it
+when an unknown relation ID appears, ensuring child events are attributed to the parent's table mapping. Both
+use the same rule: the candidates are mirrored tables with a qualifying relkind, and the one with the lowest
+`pg_inherits.inhseqno` wins, so a child of several mirrored tables always goes to the same one. Only direct
+children are remapped; deeper descendants are not replicated by CDC although the initial snapshot includes them.
 
 **Column layouts are per relation.** A child's tuples follow the child's own column order, which can differ from
 the parent's and from its siblings (`ALTER TABLE ... INHERIT` only requires matching names and types, and a
@@ -164,6 +167,18 @@ through the parent. With `publish_via_partition_root`, tuples arrive under the r
 A tuple whose column count differs from its RelationMessage is rejected. Before this, rows of affected children
 could be decoded with a sibling's column order; upgrading fixes new changes but does not repair rows already
 written, so resync affected tables.
+
+**Child-only columns.** A child with columns its parent lacks reports them as added columns of the parent's
+destination table. Their nullability is read from the parent, where they do not exist, so they are added as
+nullable without a default (ClickHouse makes them `Nullable` only in nullable mode; otherwise rows of other
+children get the type's default). Each column is emitted once per pull however many children report it; a
+conflicting type is reported and not propagated. The initial snapshot selects the parent's columns, so child-only
+columns are only populated by CDC.
+
+**Publication membership.** `CREATE PUBLICATION ... FOR TABLE parent` (without `ONLY`) includes the descendants
+that exist at that moment; unlike partitions, inheritance children created later are not added automatically.
+Add them with `ALTER PUBLICATION ... ADD TABLE child` when they are created, and CDC picks them up without
+restarting the mirror.
 
 ### 1.7 LSN Checkpoint Management
 
