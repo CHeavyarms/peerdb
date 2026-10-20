@@ -194,10 +194,18 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 	}, nil
 }
 
-func (p *PostgresCDCSource) getSourceSchemaForDestinationColumn(relID uint32, tableName string) (string, error) {
+// getSourceSchemaForDestinationColumn returns the value of _peerdb_source_schema for a tuple of rel, which is
+// mappedRelID (named tableName) or one of its descendants.
+func (p *PostgresCDCSource) getSourceSchemaForDestinationColumn(
+	rel *pglogrepl.RelationMessage, mappedRelID uint32, tableName string,
+) (string, error) {
 	if p.schemaNameForRelID == nil {
 		return "", nil
-	} else if schema, ok := p.schemaNameForRelID[relID]; ok {
+	}
+	if rel.RelationID != mappedRelID && p.stampsChildSchema(mappedRelID) {
+		return rel.Namespace, nil
+	}
+	if schema, ok := p.schemaNameForRelID[mappedRelID]; ok {
 		return schema, nil
 	}
 
@@ -205,8 +213,17 @@ func (p *PostgresCDCSource) getSourceSchemaForDestinationColumn(relID uint32, ta
 	if err != nil {
 		return "", err
 	}
-	p.schemaNameForRelID[relID] = schemaTable.Namespace
+	p.schemaNameForRelID[mappedRelID] = schemaTable.Namespace
 	return schemaTable.Namespace, nil
+}
+
+// stampsChildSchema reports whether rows of mappedRelID's inheritance descendants carry their own schema in
+// _peerdb_source_schema. The snapshot applies the same rule (snapshotSourceSchemaFor): plain-table parents only,
+// since declarative partitions published via their root arrive under the root's relid.
+func (p *PostgresCDCSource) stampsChildSchema(mappedRelID uint32) bool {
+	return p.sourceSchemaAsDestinationColumn && p.handleInheritanceForNonPartitionedTables &&
+		p.internalVersion >= shared.InternalVersion_SourceSchemaFromInheritanceChild &&
+		p.idToRelKindMap[mappedRelID] == 'r'
 }
 
 // warnRelationOnce records msg as a flow warning the first time key is seen by this connector.
@@ -1208,7 +1225,7 @@ func processInsertMessage[Items model.Items](
 		return nil, err
 	}
 
-	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
+	schemaName, err := p.getSourceSchemaForDestinationColumn(rel, relID, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -1265,7 +1282,7 @@ func processUpdateMessage[Items model.Items](
 		return nil, err
 	}
 
-	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
+	schemaName, err := p.getSourceSchemaForDestinationColumn(rel, relID, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -1328,7 +1345,7 @@ func processDeleteMessage[Items model.Items](
 		return nil, err
 	}
 
-	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
+	schemaName, err := p.getSourceSchemaForDestinationColumn(rel, relID, tableName)
 	if err != nil {
 		return nil, err
 	}
